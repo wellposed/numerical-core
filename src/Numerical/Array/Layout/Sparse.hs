@@ -1,5 +1,12 @@
 {-
-the following (currently 5) sparse formats will live here
+The following (currently 5) sparse formats will live here:
+  * Direct sparse
+  * Compressed sparse row, contiguous
+  * Compressed sparse row, inner contiguous
+  * Compressed sparse column, contiguous
+  * Compressed sparse column, inner contiguous
+
+See https://en.wikipedia.org/wiki/Sparse_matrix for an overview on these formats, or see the links posted in the later comments.
 
 
 DirectSparse 1dim
@@ -79,11 +86,14 @@ data DirectSparse
 
 
 
+-- | The "base case" of our sparse arrays. That is, this can only hold rank-1
+-- | arrays. This is kind-of in-between "List of lists (LIL)" and "Coordinate list (COO)".
 data instance Format DirectSparse 'Contiguous ('S 'Z) rep =
-    FormatDirectSparseContiguous {
-      _logicalShapeDirectSparse:: {-# UNPACK#-} !Int
-      ,_logicalBaseIndexShiftDirectSparse::{-# UNPACK#-} !Int
-      ,_indexTableDirectSparse :: ! (BufferPure rep Int )  }
+  FormatDirectSparseContiguous
+  { _dsLogicalShape          :: {-# UNPACK#-} !Int -- ^| number of nonzero entries
+  , _dsLogicalBaseIndexShift :: {-# UNPACK#-} !Int -- TODO I don't understand why you would need an offset for this. Even if this is a subarray of some larger array, why not just make _dsIndexTable point to the right offset in the array?
+  , _dsIndexTable            :: !(BufferPure rep Int)
+  }
 
 
 deriving instance Show  (BufferPure rep Int )  => Show (Format DirectSparse 'Contiguous ('S 'Z) rep)
@@ -197,13 +207,23 @@ length of the array
 
 -}
 
+-- does this need the index space shift for outer range slices???
+
+-- | Basic CSR/CSC (compressed sparse row/column) format. To use this as CSR, make
+-- | rows the outer dim; to use as CSC, make columns the outer-dim.
+
+-- | IA and JA are the names of the matrices used in
+-- | https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_.28CSR.2C_CRS_or_Yale_format.29.
+-- |
+-- | Note that, unlike the description on Wikipedia, A itself is not here! This
+-- | doesn't actually store the values of the array, it is just metadata about
+-- | how the matrix is stored.
 data ContiguousCompressedSparseMatrix rep =
-    FormatContiguousCompressedSparseInternal {
-     -- does this need the index space shift for outer range slices???
-      _outerDimContiguousSparseFormat ::  {-# UNPACK #-} !Int
-      ,_innerDimContiguousSparseFormat ::  {-# UNPACK #-} !Int
-      ,_innerDimIndexContiguousSparseFormat :: !(BufferPure rep Int)
-      ,_outerDim2InnerDimContiguousSparseFormat:: ! (BufferPure rep Int )
+  FormatContiguousCompressedSparseInternal
+  { _ccsmOuterDim :: {-# UNPACK #-} !Int -- ^| length of IA (i.e. if we are row-major, then this is the number of rows)
+  , _ccsmInnerDim :: {-# UNPACK #-} !Int -- ^| length of JA (this is the number of nonzero elements in the array)
+  , _ccsmInnerDimIndex     :: !(BufferPure rep Int) -- ^| JA
+  , _ccsmOuterDim2InnerDim :: !(BufferPure rep Int) -- ^| IA
   }
   deriving (Typeable)
 
@@ -223,16 +243,15 @@ the X dim (columns) are the inner dimension, and Y dim (rows) are the outer dim
 
 
 data  InnerContiguousCompressedSparseMatrix rep =
-   FormatInnerContiguousCompressedSparseInternal {
-      _outerDimInnerContiguousSparseFormat ::    {-# UNPACK #-} !Int
-      ,_innerDimInnerContiguousSparseFormat ::  {-# UNPACK #-} !Int
-      ,_innerDimIndexShiftInnerContiguousSparseFormat:: {-# UNPACK #-} !Int
-
-      ,_innerDimIndexInnerContiguousSparseFormat :: !(BufferPure rep Int)
-      ,_outerDim2InnerDimStartInnerContiguousSparseFormat:: ! (BufferPure rep Int )
-      ,_outerDim2InnerDimEndInnerContiguousSparseFormat:: ! (BufferPure rep Int )
-         }
-     deriving Typeable
+  FormatInnerContiguousCompressedSparseInternal
+  { _iccsmOuterDimInner           :: {-# UNPACK #-} !Int
+  , _iccsmInnerDimInner           :: {-# UNPACK #-} !Int
+  , _iccsmInnerDimIndexShiftInner :: {-# UNPACK #-} !Int
+  , _iccsmInnerDimIndexInner          :: !(BufferPure rep Int)
+  , _iccsmOuterDim2InnerDimStartInner :: !(BufferPure rep Int)
+  , _iccsmOuterDim2InnerDimEndInner   :: !(BufferPure rep Int) -- TODO Not sure what the point of this is. Can't we infer that outerDim2InnerDimEnd[k] = outerDim2InnerDimStart[k + 1] - 1?
+  }
+  deriving Typeable
 
 deriving instance (Show (BufferPure rep Int))=> Show (InnerContiguousCompressedSparseMatrix rep)
 
@@ -413,6 +432,7 @@ searchOrd  p = go where
           m = l + unsafeShiftR hml 1 + unsafeShiftR hml 6
 {-# INLINE searchOrd #-}
 
+-- | Returns index of 'key' if 'key' is in 'ks'.
 lookupExact :: (Ord k, V.Vector vec k) => vec k -> k -> Maybe Int
 lookupExact ks key
   | j <- searchOrd (\i -> compare (ks V.! i)  key) 0 (V.length ks - 1)
@@ -449,17 +469,13 @@ instance V.Vector (BufferPure rep) Int
   transposedLayout  = id
   -- {-# INLINE transposedLayout #-}
 
-  basicLogicalShape = \ form -> _logicalShapeDirectSparse form  :* Nil
+  basicLogicalShape = \ form -> _dsLogicalShape form  :* Nil
   -- {-# INLINE basicLogicalShape #-}
 
   basicCompareIndex = \ _ (a:* Nil) (b :* Nil) ->compare a b
   -- {-# INLINE basicCompareIndex #-}
 
-  basicAddressRange = \form ->
-    case (minAddress form , maxAddress form ) of
-      (Just least, Just greatest) -> Just (Range least greatest )
-      _ -> Nothing
-
+  basicAddressRange form = Range <$> minAddress form <*> maxAddress form
     where
         minAddress =
           \ (FormatDirectSparseContiguous _ _   lookupTable)->
@@ -472,14 +488,14 @@ instance V.Vector (BufferPure rep) Int
                else Nothing
 
 -- TODO, double check that im doing shift correctly
-  {-# INLINE basicToAddress #-}
-  basicToAddress =
+  {-# INLINE indexToAddress #-}
+  indexToAddress =
       \ (FormatDirectSparseContiguous shape  indexshift lookupTable) (ix:*_)->
          if  not (ix < shape && ix > 0 ) then  Nothing
           else  fmap Address  $! lookupExact lookupTable (ix + indexshift)
 
-  {-# INLINE basicToIndex #-}
-  basicToIndex =
+  {-# INLINE addressToIndex #-}
+  addressToIndex =
     \ (FormatDirectSparseContiguous _ shift lut) (Address addr) ->
         ((lut V.! addr ) - shift) :* Nil
   {-# INLINE basicAddressAsInt #-}
@@ -523,7 +539,7 @@ instance V.Vector (BufferPure rep) Int
             resAddr = Address $! bsearchUp  (\lix-> ix < ((lut V.! lix)-shift) )
                         0 (V.length lut )
         in case mebeAddress of
-          Nothing ->  resAddr `seq` (Just (basicToIndex form resAddr ,  resAddr))
+          Nothing ->  resAddr `seq` (Just (addressToIndex form resAddr ,  resAddr))
                 -- Q: do i want the Index part of the tuple to be strict or not?
                 -- leaving it lazy for now
                 -- TODO / FIX / AUDIT ME / NOT SURE
@@ -540,9 +556,9 @@ instance V.Vector (BufferPure rep) Int
                                 basicHybridSearchUp
                                   (\lix-> ix <  ((lut V.! lix)-shift ) )
                                   adr (V.length lut -1)
-                  in  Just (basicToIndex form nextAddr ,  nextAddr)
+                  in  Just (addressToIndex form nextAddr ,  nextAddr)
               else
-                resAddr `seq` (Just (basicToIndex form resAddr ,  resAddr))
+                resAddr `seq` (Just (addressToIndex form resAddr ,  resAddr))
 
 
 ------------
@@ -562,8 +578,8 @@ instance  (V.Vector (BufferPure rep) Int )
   {-# INLINE transposedLayout #-}
 
 
-  basicLogicalShape = \ form ->  (_innerDimContiguousSparseFormat $ _getFormatContiguousCSR  form ) :*
-         ( _outerDimContiguousSparseFormat $ _getFormatContiguousCSR form ):* Nil
+  basicLogicalShape = \ form ->  (_ccsmInnerDim $ _getFormatContiguousCSR  form ) :*
+         ( _ccsmOuterDim $ _getFormatContiguousCSR form ):* Nil
           --   x_ix :* y_ix
   {-# INLINE basicLogicalShape #-}
 
@@ -687,8 +703,8 @@ instance  (V.Vector (BufferPure rep) Int )
   {-#  INLINE basicAddressAsInt #-}
   basicAddressAsInt = \ _ (SparseAddress _ addr)-> addr
 
-  {-# INLINE basicToIndex #-}
-  basicToIndex =
+  {-# INLINE addressToIndex #-}
+  addressToIndex =
         \ (FormatContiguousCompressedSparseRow
             (FormatContiguousCompressedSparseInternal  _ _ columnIndex _))
             (SparseAddress outer inner) ->
@@ -728,8 +744,8 @@ overhead, but in general branch prediction should work out ok.
                     else Just (SparseAddress (outer + 1) (inner + 1 ) )
 
 
-  -- {-# INLINE basicToAddress #-}
-  basicToAddress =
+  -- {-# INLINE indexToAddress #-}
+  indexToAddress =
         \ (FormatContiguousCompressedSparseRow
             (FormatContiguousCompressedSparseInternal  y_row_range x_col_range
               columnIndex rowStartIndex))
